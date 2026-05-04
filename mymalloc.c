@@ -12,29 +12,31 @@ struct MemoryHeader
     size_t size;
     bool is_allocated;
     bool is_prev_allocated;
-    struct MemoryHeader *next;
 };
 typedef struct MemoryHeader MemoryHeader_t;
 
-struct MemoryManager
+struct Footer
 {
-    MemoryHeader_t *head;
-    MemoryHeader_t *tail;
+    size_t size;
 };
+typedef struct Footer Footer_t;
 
 /* ─── Globals ─────────────────────────────────────────────────────────────── */
 pthread_mutex_t global_malloc_lock = PTHREAD_MUTEX_INITIALIZER;
-struct MemoryManager memory_manager;
+MemoryHeader_t *memory_head;
 
 /* ─── Internal declarations ───────────────────────────────────────────────── */
 size_t align_size(size_t size);
 void *header_to_block(MemoryHeader_t *header);
 MemoryHeader_t *block_to_header(void *block);
-MemoryHeader_t *get_prev_header(MemoryHeader_t *header);
 MemoryHeader_t *get_free_block(size_t request_size);
 void split_free_block(MemoryHeader_t *header, size_t request_size);
 void forward_coalescing(MemoryHeader_t *header);
 void backward_coalescing(MemoryHeader_t *header);
+Footer_t *get_prev_footer(MemoryHeader_t *header);
+void write_footer(MemoryHeader_t *header);
+MemoryHeader_t *get_prev_header(MemoryHeader_t *header, size_t size);
+MemoryHeader_t *get_next_header(MemoryHeader_t *header);
 
 /* ─── Internal helpers ────────────────────────────────────────────────────── */
 size_t align_size(size_t size)
@@ -52,77 +54,90 @@ MemoryHeader_t *block_to_header(void *block)
     return (MemoryHeader_t *)block - 1;
 }
 
-MemoryHeader_t *get_prev_header(MemoryHeader_t *header)
-{
-    if (!header)
-        return NULL;
-
-    MemoryHeader_t *current = memory_manager.head;
-    while (current)
-    {
-        if (current->next == header)
-            return current;
-        current = current->next;
-    }
-    return NULL;
-}
-
 MemoryHeader_t *get_free_block(size_t request_size)
 {
-    MemoryHeader_t *current_header = memory_manager.head;
+    MemoryHeader_t *current_header = memory_head;
     while (current_header)
     {
         if (current_header->is_allocated == false && current_header->size >= request_size)
         {
             return current_header;
         }
-        current_header = current_header->next;
+        current_header = get_next_header(current_header);
     }
     return NULL;
 }
 
 void split_free_block(MemoryHeader_t *header, size_t request_size)
 {
-    if ((header->size - request_size) <= (sizeof(MemoryHeader_t) + 16)) {
-        header->next->is_prev_allocated = true;
+    if ((header->size - request_size) <= (sizeof(MemoryHeader_t) + 16))
+    {
+        MemoryHeader_t *next_block = get_next_header(header);
+        next_block->is_prev_allocated = true;
         return;
     }
-
     MemoryHeader_t *new_block = (char *)(header + 1) + request_size;
     new_block->is_allocated = false;
     new_block->size = header->size - request_size - sizeof(MemoryHeader_t);
-    new_block->next = header->next;
     new_block->is_prev_allocated = true;
-    new_block->next->is_prev_allocated = false;
+    write_footer(new_block);
 
-    header->next = new_block;
+    MemoryHeader_t *next_block = get_next_header(header);
+    next_block->is_prev_allocated = false;
+
     header->size = request_size;
 }
 
 void forward_coalescing(MemoryHeader_t *header)
 {
-    MemoryHeader_t *next_header = header->next;
+    MemoryHeader_t *next_header = get_next_header(header);
     while (next_header)
     {
         if (!next_header->is_allocated)
         {
             header->size += sizeof(MemoryHeader_t) + next_header->size;
-            next_header = next_header->next;
-            header->next = next_header;
+            next_header = get_next_header(next_header);
         }
         else
-            return;
+            break;
     }
+    write_footer(header);
 }
 
 void backward_coalescing(MemoryHeader_t *header)
 {
-    MemoryHeader_t *prev_header = get_prev_header(header);
-    if (prev_header && !prev_header->is_allocated)
+    if (!header->is_prev_allocated)
     {
+        Footer_t *prev_footer = get_prev_footer(header);
+        MemoryHeader_t *prev_header = get_prev_header(header, prev_footer->size);
+
         prev_header->size += sizeof(MemoryHeader_t) + header->size;
-        prev_header->next = header->next;
+
+        write_footer(prev_header);
     }
+}
+
+Footer_t *get_prev_footer(MemoryHeader_t *header)
+{
+    return (Footer_t *)((char*)header - sizeof(Footer_t));
+}
+
+void write_footer(MemoryHeader_t *header)
+{
+    Footer_t *footer = (Footer_t*)((char*)(header + 1) + header->size - sizeof(Footer_t));
+    footer->size = header->size;
+}
+
+MemoryHeader_t *get_prev_header(MemoryHeader_t *header, size_t size)
+{
+    return (MemoryHeader_t *)((char*)header - size - sizeof(MemoryHeader_t));
+}
+
+MemoryHeader_t *get_next_header(MemoryHeader_t *header) {
+    if ((void *)((char*)(header + 1) + header->size) == sbrk(0))
+        return NULL;
+    else
+        return (MemoryHeader_t *)((char*)(header + 1) + header->size);
 }
 
 /* ─── Public API ──────────────────────────────────────────────────────────── */
@@ -160,17 +175,10 @@ void *malloc(size_t request_size)
     header->size = request_size;
     header->is_allocated = true;
     header->is_prev_allocated = true;
-    header->next = NULL;
 
-    if (!memory_manager.head)
+    if (!memory_head)
     {
-        memory_manager.head = header;
-        memory_manager.tail = header;
-    }
-    else
-    {
-        memory_manager.tail->next = header;
-        memory_manager.tail = header;
+        memory_head = header;
     }
 
     pthread_mutex_unlock(&global_malloc_lock);
@@ -227,45 +235,46 @@ void free(void *block)
     pthread_mutex_lock(&global_malloc_lock);
     MemoryHeader_t *header = block_to_header(block);
 
-    if (header == memory_manager.tail)
+    if ((char*)block + header->size == sbrk(0))
     {
-        if (memory_manager.head == memory_manager.tail)
+        if (memory_head == header)
         {
-            memory_manager.head = memory_manager.tail = NULL;
+            memory_head = NULL;
             sbrk(-(intptr_t)(header->size + sizeof(MemoryHeader_t)));
         }
         else
         {
-            MemoryHeader_t *current = header;
-            current->is_allocated = false;
             size_t remove_size;
 
-            while (!current->is_allocated)
+            do
             {
-                remove_size = current->size;
+                remove_size = header->size;
 
-                current = get_prev_header(current);
-
-                sbrk(-(intptr_t)(remove_size + sizeof(MemoryHeader_t)));
-
-                if (current)
+                if (!header->is_prev_allocated)
                 {
-                    memory_manager.tail = current;
-                    memory_manager.tail->next = NULL;
+                    Footer_t *prev_footer = get_prev_footer(header);
+                    header = get_prev_header(header, prev_footer->size);
                 }
                 else
                 {
-                    memory_manager.head = memory_manager.tail = NULL;
-                    pthread_mutex_unlock(&global_malloc_lock);
-                    return;
+                    if (memory_head == header) 
+                        memory_head = header = NULL;
+                    else
+                        header = NULL;
                 }
-            }
+                sbrk(-(intptr_t)(remove_size + sizeof(MemoryHeader_t)));
+
+            } while (header);
+
+            pthread_mutex_unlock(&global_malloc_lock);
+            return;
         }
     }
     else
     {
         header->is_allocated = false;
-        header->next->is_prev_allocated = false;
+        MemoryHeader_t *next_header = get_next_header(header);
+        next_header->is_prev_allocated = false;
         forward_coalescing(header);
         backward_coalescing(header);
     }
