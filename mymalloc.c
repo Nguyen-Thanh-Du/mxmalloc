@@ -115,8 +115,11 @@ void *malloc(size_t request_size)
 
 void *realloc(void *block, size_t request_size)
 {
-    if (!block || !request_size)
+    if (!block && request_size)
+        return malloc(request_size);
+    if (!request_size) {
         return NULL;
+    }
 
     MemoryHeader_t *header = block_to_header(block);
 
@@ -168,6 +171,7 @@ void free(void *block)
         {
             MemoryHeader_t *current = header;
             current->is_allocated = false;
+            size_t remove_size;
 
             while (!current->is_allocated) {
                 remove_size = current->size;
@@ -191,7 +195,7 @@ void free(void *block)
     }
     else
     {
-        header->is_allocated = false;
+        header->is_allocatled = false;
     }
     pthread_mutex_unlock(&global_malloc_lock);
 }
