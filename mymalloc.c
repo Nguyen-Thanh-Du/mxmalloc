@@ -11,6 +11,7 @@ struct MemoryHeader
 {
     size_t size;
     bool is_allocated;
+    bool is_prev_allocated;
     struct MemoryHeader *next;
 };
 typedef struct MemoryHeader MemoryHeader_t;
@@ -82,13 +83,17 @@ MemoryHeader_t *get_free_block(size_t request_size)
 
 void split_free_block(MemoryHeader_t *header, size_t request_size)
 {
-    if ((header->size - request_size) <= (sizeof(MemoryHeader_t) + 16))
+    if ((header->size - request_size) <= (sizeof(MemoryHeader_t) + 16)) {
+        header->next->is_prev_allocated = true;
         return;
+    }
 
     MemoryHeader_t *new_block = (char *)(header + 1) + request_size;
     new_block->is_allocated = false;
     new_block->size = header->size - request_size - sizeof(MemoryHeader_t);
     new_block->next = header->next;
+    new_block->is_prev_allocated = true;
+    new_block->next->is_prev_allocated = false;
 
     header->next = new_block;
     header->size = request_size;
@@ -154,6 +159,7 @@ void *malloc(size_t request_size)
 
     header->size = request_size;
     header->is_allocated = true;
+    header->is_prev_allocated = true;
     header->next = NULL;
 
     if (!memory_manager.head)
@@ -259,6 +265,7 @@ void free(void *block)
     else
     {
         header->is_allocated = false;
+        header->next->is_prev_allocated = false;
         forward_coalescing(header);
         backward_coalescing(header);
     }
