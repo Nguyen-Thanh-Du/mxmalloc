@@ -34,6 +34,9 @@ void *malloc(size_t request_size);
 void *realloc(void *block, size_t request_size);
 void *calloc(size_t num_element, size_t element_size);
 void free(void *block);
+void forward_coalescing(MemoryHeader_t *header);
+void backward_coalescing(MemoryHeader_t *header);
+
 
 size_t align_size(size_t size)
 {
@@ -195,7 +198,9 @@ void free(void *block)
     }
     else
     {
-        header->is_allocatled = false;
+        header->is_allocated = false;
+        forward_coalescing(header);
+        backward_coalescing(header);
     }
     pthread_mutex_unlock(&global_malloc_lock);
 }
@@ -225,4 +230,25 @@ void split_free_block(MemoryHeader_t *header, size_t request_size) {
     
     header->next = new_block;
     header->size = request_size;
+}
+
+void forward_coalescing(MemoryHeader_t *header) {
+    MemoryHeader_t *next_header = header->next;
+    while (next_header) {
+        if (!next_header->is_allocated) {
+            header->size += sizeof(MemoryHeader_t) + next_header->size;
+            next_header = next_header->next;
+            header->next = next_header;
+        }
+        else 
+            return;
+    }
+}
+
+void backward_coalescing(MemoryHeader_t *header) {
+    MemoryHeader_t *prev_header = get_prev_header(header);
+    if (prev_header && !prev_header->is_allocated) {
+        prev_header->size += sizeof(MemoryHeader_t) + header->size;
+        prev_header->next = header->next;
+    }
 }
