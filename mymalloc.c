@@ -56,16 +56,21 @@ MemoryHeader_t *block_to_header(void *block)
 
 MemoryHeader_t *get_free_block(size_t request_size)
 {
-    MemoryHeader_t *current_header = memory_head;
-    while (current_header)
+    MemoryHeader_t *res = NULL;
+    MemoryHeader_t *tmp = memory_head;
+
+    while (tmp)
     {
-        if (current_header->is_allocated == false && current_header->size >= request_size)
+        if (!tmp->is_allocated && tmp->size >= request_size)
         {
-            return current_header;
+            if (!res)
+                res = tmp;
+            else
+                res = tmp->size < res->size ? tmp : res;
         }
-        current_header = get_next_header(current_header);
+        tmp = get_next_header(tmp);
     }
-    return NULL;
+    return res;
 }
 
 void split_free_block(MemoryHeader_t *header, size_t request_size)
