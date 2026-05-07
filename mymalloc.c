@@ -21,9 +21,17 @@ struct Footer
 };
 typedef struct Footer Footer_t;
 
+struct FreeNode
+{
+    MemoryHeader_t *fd;
+    MemoryHeader_t *bk;
+};
+typedef struct FreeNode FreeNode_t;
+
 /* ─── Globals ─────────────────────────────────────────────────────────────── */
 pthread_mutex_t global_malloc_lock = PTHREAD_MUTEX_INITIALIZER;
 MemoryHeader_t *memory_head;
+MemoryHeader_t *free_blocks[4];
 
 /* ─── Internal declarations ───────────────────────────────────────────────── */
 size_t align_size(size_t size);
@@ -32,11 +40,14 @@ MemoryHeader_t *block_to_header(void *block);
 MemoryHeader_t *get_free_block(size_t request_size);
 void split_free_block(MemoryHeader_t *header, size_t request_size);
 void forward_coalescing(MemoryHeader_t *header);
-void backward_coalescing(MemoryHeader_t *header);
+MemoryHeader_t *backward_coalescing(MemoryHeader_t *header);
 Footer_t *get_prev_footer(MemoryHeader_t *header);
 void write_footer(MemoryHeader_t *header);
 MemoryHeader_t *get_prev_header(MemoryHeader_t *header, size_t size);
 MemoryHeader_t *get_next_header(MemoryHeader_t *header);
+size_t size_to_bin(size_t size);
+void insert_free(MemoryHeader_t *header);
+void remove_free(MemoryHeader_t *header);
 
 /* ─── Internal helpers ────────────────────────────────────────────────────── */
 size_t align_size(size_t size)
@@ -56,20 +67,29 @@ MemoryHeader_t *block_to_header(void *block)
 
 MemoryHeader_t *get_free_block(size_t request_size)
 {
+    size_t idx = size_to_bin(request_size);
     MemoryHeader_t *res = NULL;
-    MemoryHeader_t *tmp = memory_head;
 
-    while (tmp)
+    while (idx <= 3)
     {
-        if (!tmp->is_allocated && tmp->size >= request_size)
+        MemoryHeader_t *current = free_blocks[idx];
+        while (current)
         {
-            if (!res)
-                res = tmp;
-            else
-                res = tmp->size < res->size ? tmp : res;
+            if (current->size >= request_size)
+            {
+                if (!res)
+                    res = current;
+                else
+                    res = current->size < res->size ? current : res;
+            }
+            FreeNode_t *node = (FreeNode_t *)(current + 1);
+            current = node->fd;
         }
-        tmp = get_next_header(tmp);
+        idx++;
+        if (res)
+            break;
     }
+
     return res;
 }
 
@@ -86,6 +106,7 @@ void split_free_block(MemoryHeader_t *header, size_t request_size)
     new_block->size = header->size - request_size - sizeof(MemoryHeader_t);
     new_block->is_prev_allocated = true;
     write_footer(new_block);
+    insert_free(new_block);
 
     MemoryHeader_t *next_block = get_next_header(header);
     next_block->is_prev_allocated = false;
@@ -101,6 +122,7 @@ void forward_coalescing(MemoryHeader_t *header)
         if (!next_header->is_allocated)
         {
             header->size += sizeof(MemoryHeader_t) + next_header->size;
+            remove_free(next_header);
             next_header = get_next_header(next_header);
         }
         else
@@ -109,40 +131,97 @@ void forward_coalescing(MemoryHeader_t *header)
     write_footer(header);
 }
 
-void backward_coalescing(MemoryHeader_t *header)
+MemoryHeader_t *backward_coalescing(MemoryHeader_t *header)
 {
     if (!header->is_prev_allocated)
     {
         Footer_t *prev_footer = get_prev_footer(header);
         MemoryHeader_t *prev_header = get_prev_header(header, prev_footer->size);
 
+        remove_free(prev_header);
+
         prev_header->size += sizeof(MemoryHeader_t) + header->size;
 
         write_footer(prev_header);
+
+        return prev_header;
     }
+    return header;
 }
 
 Footer_t *get_prev_footer(MemoryHeader_t *header)
 {
-    return (Footer_t *)((char*)header - sizeof(Footer_t));
+    return (Footer_t *)((char *)header - sizeof(Footer_t));
 }
 
 void write_footer(MemoryHeader_t *header)
 {
-    Footer_t *footer = (Footer_t*)((char*)(header + 1) + header->size - sizeof(Footer_t));
+    Footer_t *footer = (Footer_t *)((char *)(header + 1) + header->size - sizeof(Footer_t));
     footer->size = header->size;
 }
 
 MemoryHeader_t *get_prev_header(MemoryHeader_t *header, size_t size)
 {
-    return (MemoryHeader_t *)((char*)header - size - sizeof(MemoryHeader_t));
+    return (MemoryHeader_t *)((char *)header - size - sizeof(MemoryHeader_t));
 }
 
-MemoryHeader_t *get_next_header(MemoryHeader_t *header) {
-    if ((void *)((char*)(header + 1) + header->size) == sbrk(0))
+MemoryHeader_t *get_next_header(MemoryHeader_t *header)
+{
+    if ((void *)((char *)(header + 1) + header->size) == sbrk(0))
         return NULL;
     else
-        return (MemoryHeader_t *)((char*)(header + 1) + header->size);
+        return (MemoryHeader_t *)((char *)(header + 1) + header->size);
+}
+
+size_t size_to_bin(size_t size)
+{
+    size_t idx = 3;
+    if (size <= 32)
+        idx = 0;
+    else if (size <= 64)
+        idx = 1;
+    else if (size <= 128)
+        idx = 2;
+
+    return idx;
+}
+
+void insert_free(MemoryHeader_t *header)
+{
+    size_t idx = size_to_bin(header->size);
+    FreeNode_t *node = (FreeNode_t *)(header + 1);
+    node->bk = NULL;
+    node->fd = free_blocks[idx];
+
+    if (free_blocks[idx])
+    {
+        FreeNode_t *old_head = (FreeNode_t *)(free_blocks[idx] + 1);
+        old_head->bk = header;
+    }
+
+    free_blocks[idx] = header;
+}
+
+void remove_free(MemoryHeader_t *header)
+{
+    if (!header) return;
+
+    FreeNode_t *node = (FreeNode_t *)(header + 1);
+
+    if (node->bk)
+    {
+        FreeNode_t *prev = (FreeNode_t *)(node->bk + 1);
+        prev->fd = node->fd;
+    }
+    else
+    {
+        free_blocks[size_to_bin(header->size)] = node->fd;
+    }
+    if (node->fd)
+    {
+        FreeNode_t *next = (FreeNode_t *)(node->fd + 1);
+        next->bk = node->bk;
+    }
 }
 
 /* ─── Public API ──────────────────────────────────────────────────────────── */
@@ -160,6 +239,8 @@ void *malloc(size_t request_size)
 
     if (header)
     {
+        remove_free(header);
+
         split_free_block(header, request_size);
 
         header->is_allocated = true;
@@ -240,7 +321,7 @@ void free(void *block)
     pthread_mutex_lock(&global_malloc_lock);
     MemoryHeader_t *header = block_to_header(block);
 
-    if ((char*)block + header->size == sbrk(0))
+    if ((char *)block + header->size == sbrk(0))
     {
         if (memory_head == header)
         {
@@ -259,10 +340,11 @@ void free(void *block)
                 {
                     Footer_t *prev_footer = get_prev_footer(header);
                     header = get_prev_header(header, prev_footer->size);
+                    remove_free(header);
                 }
                 else
                 {
-                    if (memory_head == header) 
+                    if (memory_head == header)
                         memory_head = header = NULL;
                     else
                         header = NULL;
@@ -281,7 +363,8 @@ void free(void *block)
         MemoryHeader_t *next_header = get_next_header(header);
         next_header->is_prev_allocated = false;
         forward_coalescing(header);
-        backward_coalescing(header);
+        header = backward_coalescing(header);
+        insert_free(header);
     }
     pthread_mutex_unlock(&global_malloc_lock);
 }
